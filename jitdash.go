@@ -136,8 +136,10 @@ func (b *Build) FetchDetails() error {
 
     var details JsonObject
     if err = json.NewDecoder(r.Body).Decode(&details); err != nil {
+        r.Body.Close()
         return err
     }
+    r.Body.Close()
 
     result, ok := details.GetString("result")
     if !ok {
@@ -194,7 +196,7 @@ func (s BuildSorter) Less(i, j int) bool {
     return s[i].Id < s[j].Id
 }
 
-func (i *Instance) ProcessJobObject(jobIf interface{}, maxBuilds int) (*Job, bool) {
+func (i *Instance) ProcessJobObject(jobIf interface{}) (*Job, bool) {
     job, ok := AsJsonObject(jobIf)
     if !ok {
         return nil, false
@@ -228,8 +230,10 @@ func (i *Instance) ProcessJobObject(jobIf interface{}, maxBuilds int) (*Job, boo
 
     var details JsonObject
     if err = json.NewDecoder(r.Body).Decode(&details); err != nil {
+        r.Body.Close()
         return nil, false
     }
+    r.Body.Close()
 
     buildObjects, ok := details.GetArray("builds")
     if !ok {
@@ -247,35 +251,29 @@ func (i *Instance) ProcessJobObject(jobIf interface{}, maxBuilds int) (*Job, boo
     }
 
     sort.Sort(BuildSorter(builds))
-    if len(builds) > maxBuilds {
-        builds = builds[len(builds) - maxBuilds:]
-    }
-
-    for _, b := range builds {
-        b.FetchDetails()
-    }
-
     return &Job{name, url, builds}, true
 }
 
-func (i *Instance) FetchJobs(maxBuilds int) []*Job {
+func (i *Instance) FetchJobs() []*Job {
     log.Printf("fetching jobs for instance %s\n", i.Name)
 
     var jobs []*Job
     for _, folderUrl := range i.Folders {
+        log.Printf("fetching folder %s\n", folderUrl)
+
         r, err := http.Get(folderUrl)
         if err != nil {
+            log.Printf("error fetching folder %s: %s\n", folderUrl, err)
             continue
         }
 
         var folder JsonObject
         if err = json.NewDecoder(r.Body).Decode(&folder); err != nil {
+            log.Printf("error reading folder %s: %s\n", folderUrl, err)
+            r.Body.Close()
             continue
         }
-
-        if class, ok := folder.GetString("_class"); !ok || class != "com.cloudbees.hudson.plugins.folder.Folder" {
-            continue
-        }
+        r.Body.Close()
 
         jobObjects, ok := folder.GetArray("jobs")
         if !ok {
@@ -283,7 +281,7 @@ func (i *Instance) FetchJobs(maxBuilds int) []*Job {
         }
 
         for _, j := range jobObjects {
-            job, ok := i.ProcessJobObject(j, maxBuilds)
+            job, ok := i.ProcessJobObject(j)
             if ok {
                 jobs = append(jobs, job)
             }
@@ -401,6 +399,15 @@ func main() {
         maxBuilds = 10
     }
 
+    maxHistory, ok := config.GetInt64("maxHistory")
+    if !ok {
+        maxHistory = 10
+    }
+
+    if maxHistory > maxBuilds {
+        maxHistory = maxBuilds
+    }
+
     instancesObject, ok := config.GetObject("instances")
     if !ok {
         fmt.Fprintf(os.Stderr, "invalid config: no instances\n")
@@ -417,12 +424,47 @@ func main() {
         instances = append(instances, i)
     }
 
-    fmt.Printf("<html><head><style>td.sparkline { font-family: \"Consolas, \\\"Liberation Mono\\\", Menlo, Courier, monospace\"; font-size: 12px }</style></head><body>\n")
+    var jobs [][]*Job
     for _, i := range instances {
+        jobs = append(jobs, i.FetchJobs())
+    }
+
+    // Fetch build details in parallel
+    const workerCount = 100
+    work, done := make(chan *Build, workerCount), make(chan bool, workerCount)
+    for i := 0; i < workerCount; i++ {
+        go func(w <-chan *Build, d chan<- bool) {
+            for b := range w {
+                b.FetchDetails()
+            }
+            done <- true
+        }(work, done)
+    }
+
+    log.Print("Fetching build details...\n")
+    for _, ja := range jobs {
+        for _, j := range ja {
+            if len(j.Builds) > int(maxBuilds) {
+                j.Builds = j.Builds[len(j.Builds) - int(maxBuilds):]
+            }
+            for _, b := range j.Builds {
+                work <- b
+            }
+        }
+    }
+    close(work)
+
+    for i := 0; i < workerCount; i++ {
+        <-done
+    }
+    close(done)
+
+    fmt.Printf("<html><head><style>td.sparkline { font-family: \"Consolas, \\\"Liberation Mono\\\", Menlo, Courier, monospace\"; font-size: 12px }</style></head><body>\n")
+    for n, i := range instances {
         fmt.Printf("<h2>%s</h2>\n", i.Name)
         fmt.Printf("<table><tr><th>Job</th><th>History</th></tr>\n")
-        for _, job := range i.FetchJobs(int(maxBuilds)) {
-            fmt.Printf("<tr><td><a href=\"%s\">%s</a></td><td class=\"sparkline\">%s</td></tr>\n", job.Url, job.Name, job.RenderHistory(10))
+        for _, job := range jobs[n] {
+            fmt.Printf("<tr><td><a href=\"%s\">%s</a></td><td class=\"sparkline\">%s</td></tr>\n", job.Url, job.Name, job.RenderHistory(int(maxHistory)))
         }
         fmt.Printf("</table><br />\n")
     }
