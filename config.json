@@ -1,0 +1,17 @@
+{
+    "maxBuilds": 10,
+    "instances": {
+        "ci.dot.net": {
+            "folders": [
+                "https://ci.dot.net/job/dotnet_coreclr/job/master/",
+                "https://ci.dot.net/job/dotnet_coreclr/job/master/job/jitstress/"
+            ],
+            "exclude": [
+                ".*_prtest$",
+                ".*_flow$",
+                "^generator$",
+                "^help_message$"
+            ]
+        }
+    }
+}
